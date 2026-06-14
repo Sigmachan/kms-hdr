@@ -120,20 +120,23 @@ static void build_ctm_identity(uint64_t out[9]) {
 }
 
 /* ── HDR10 metadata ──────────────────────────────────────────────────────── */
-/* struct drm_hdr_output_metadata: 4-byte type + hdr_metadata_infoframe */
-#pragma pack(push, 1)
+/*
+ * Mirrors struct hdr_output_metadata from <drm/drm_mode.h> exactly.
+ * sizeof = 32:  u32(4) + u8(1) + u8(1) + [no pad, u16 is at offset 6] +
+ *               u16[3][2](12) + u16[2](4) + u16*4(8) + trailing pad(2)
+ * Must NOT be packed — the kernel validates blob size == 32.
+ */
 typedef struct {
-    uint32_t metadata_type;         /* 1 = HDMI static */
-    uint8_t  eotf;                  /* 2 = ST2084 (PQ) */
-    uint8_t  metadata_descriptor;   /* 0 = type 1 */
-    uint16_t display_primaries[3][2]; /* G,B,R x,y × 50000 */
+    uint32_t metadata_type;         /* 0 = HDMI_STATIC_METADATA_TYPE1    */
+    uint8_t  eotf;                  /* 2 = PQ/ST2084                     */
+    uint8_t  metadata_descriptor;   /* 0 = Static_Metadata_Descriptor_ID */
+    uint16_t display_primaries[3][2]; /* G,B,R  x,y × 50000              */
     uint16_t white_point[2];
     uint16_t max_display_mastering_luminance;
     uint16_t min_display_mastering_luminance;
     uint16_t max_content_light_level;
     uint16_t max_frame_average_light_level;
 } hdr_meta_t;
-#pragma pack(pop)
 
 static hdr_meta_t build_hdr_meta(void) {
     hdr_meta_t m = {0};
