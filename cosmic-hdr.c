@@ -1,19 +1,21 @@
 /*
- * cosmic-hdr.c  — HDR10 + BT.2020 color pipeline injector via KMS atomic
+ * cosmic-hdr.c  — HDR10 + BT.2020/DCI-P3 color pipeline injector via KMS atomic
  *
  * Mirrors KDE Plasma 6 HDR pipeline:
- *   DEGAMMA (sRGB→linear) → CTM (BT.709→BT.2020) → GAMMA (linear→PQ/ST2084)
+ *   DEGAMMA (sRGB→linear) → CTM (BT.709→target gamut) → GAMMA (linear→PQ/ST2084)
  *   + HDR_OUTPUT_METADATA + Colorspace=BT2020_RGB on the connector
  *
  * Steals DRM master via VT switch (tty1→tty2→tty1, screen blanks ~0.5s).
  * Properties persist after master release (cosmic-comp doesn't reset them).
  *
  * Usage (must be root):
- *   sudo cosmic-hdr                     apply (reads /etc/cosmic-hdr.conf)
- *   sudo cosmic-hdr reset               restore SDR
- *   sudo cosmic-hdr --sdr-nits 203      override SDR white brightness
- *   sudo cosmic-hdr --peak-nits 800     override display peak
- *   sudo cosmic-hdr --gamut 100         override gamut expansion 0-100%
+ *   sudo cosmic-hdr                          apply (reads /etc/cosmic-hdr.conf)
+ *   sudo cosmic-hdr reset                    restore SDR
+ *   sudo cosmic-hdr --sdr-nits 203          override SDR white brightness
+ *   sudo cosmic-hdr --peak-nits 800         override display peak
+ *   sudo cosmic-hdr --gamut 100             override gamut expansion 0-100%
+ *   sudo cosmic-hdr --gamut-mode dci-p3     use DCI-P3 D65 instead of BT.2020
+ *   sudo cosmic-hdr --bpc 10               request 10-bit output
  */
 
 #include <stdio.h>
@@ -50,19 +52,27 @@
 #define DEFAULT_SDR_NITS   203
 #define DEFAULT_PEAK_NITS  800
 #define DEFAULT_GAMUT      100
+#define DEFAULT_GAMUT_MODE 0   /* 0=BT.2020, 1=DCI-P3 */
+#define DEFAULT_MAX_BPC    10
 
-static void load_conf(int *sdr_nits, int *peak_nits, int *gamut_pct) {
-    *sdr_nits  = DEFAULT_SDR_NITS;
-    *peak_nits = DEFAULT_PEAK_NITS;
-    *gamut_pct = DEFAULT_GAMUT;
+static void load_conf(int *sdr_nits, int *peak_nits, int *gamut_pct,
+                      int *gamut_mode, int *max_bpc) {
+    *sdr_nits   = DEFAULT_SDR_NITS;
+    *peak_nits  = DEFAULT_PEAK_NITS;
+    *gamut_pct  = DEFAULT_GAMUT;
+    *gamut_mode = DEFAULT_GAMUT_MODE;
+    *max_bpc    = DEFAULT_MAX_BPC;
     FILE *f = fopen(CONF_PATH, "r");
     if (!f) return;
     char line[256];
     while (fgets(line, sizeof(line), f)) {
-        int v;
-        if (sscanf(line, "SDR_NITS=%d",  &v) == 1) *sdr_nits  = v;
-        if (sscanf(line, "PEAK_NITS=%d", &v) == 1) *peak_nits = v;
-        if (sscanf(line, "GAMUT=%d",     &v) == 1) *gamut_pct = v;
+        int v; char s[64];
+        if (sscanf(line, "SDR_NITS=%d",     &v) == 1) *sdr_nits   = v;
+        if (sscanf(line, "PEAK_NITS=%d",    &v) == 1) *peak_nits  = v;
+        if (sscanf(line, "GAMUT=%d",        &v) == 1) *gamut_pct  = v;
+        if (sscanf(line, "MAX_BPC=%d",      &v) == 1) *max_bpc    = v;
+        if (sscanf(line, "GAMUT_MODE=%63s", s)  == 1)
+            *gamut_mode = (strncmp(s, "dci-p3", 6) == 0) ? 1 : 0;
     }
     fclose(f);
 }
@@ -127,13 +137,24 @@ static drm_lut_entry *build_linear_lut(int n) {
 /* ── CTM ─────────────────────────────────────────────────────────────────── */
 /*
  * BT.709 → BT.2020 gamut expansion.
- * Computed from standard primaries via (BT.2020←XYZ) × (XYZ←BT.709), D65.
+ * Derived from (BT.2020←XYZ) × (XYZ←BT.709), D65 white point.
  * Applied in linear light domain (between DEGAMMA and GAMMA).
  */
 static const double CTM_709_TO_2020[3][3] = {
     { 0.627504,  0.329275,  0.043303 },
     { 0.069108,  0.919519,  0.011360 },
     { 0.016394,  0.088011,  0.895380 },
+};
+
+/*
+ * BT.709 → DCI-P3 D65 gamut expansion.
+ * Derived from (P3-D65←XYZ) × (XYZ←BT.709), D65 white point.
+ * P3 is a middle ground: wider than sRGB, not as wide as BT.2020.
+ */
+static const double CTM_709_TO_DCIP3[3][3] = {
+    { 0.822461,  0.177538,  0.000000 },
+    { 0.033195,  0.966805,  0.000000 },
+    { 0.017083,  0.072397,  0.910520 },
 };
 
 static void build_ctm(const double m[3][3], uint64_t out[9]) {
@@ -235,16 +256,22 @@ static int vt_switch(int tty_fd, int target_vt) {
 
 /* ── main ────────────────────────────────────────────────────────────────── */
 int main(int argc, char **argv) {
-    int reset = 0, sdr_nits, peak_nits, gamut_pct;
-    load_conf(&sdr_nits, &peak_nits, &gamut_pct);
+    int reset = 0, sdr_nits, peak_nits, gamut_pct, gamut_mode, max_bpc;
+    load_conf(&sdr_nits, &peak_nits, &gamut_pct, &gamut_mode, &max_bpc);
 
     for (int i = 1; i < argc; i++) {
-        if      (strcmp(argv[i], "reset") == 0)         reset    = 1;
-        else if (strcmp(argv[i], "--sdr-nits")  == 0 && i+1 < argc) sdr_nits  = atoi(argv[++i]);
-        else if (strcmp(argv[i], "--peak-nits") == 0 && i+1 < argc) peak_nits = atoi(argv[++i]);
-        else if (strcmp(argv[i], "--gamut")     == 0 && i+1 < argc) gamut_pct = atoi(argv[++i]);
+        if      (strcmp(argv[i], "reset") == 0)              reset      = 1;
+        else if (strcmp(argv[i], "--sdr-nits")  == 0 && i+1 < argc) sdr_nits   = atoi(argv[++i]);
+        else if (strcmp(argv[i], "--peak-nits") == 0 && i+1 < argc) peak_nits  = atoi(argv[++i]);
+        else if (strcmp(argv[i], "--gamut")     == 0 && i+1 < argc) gamut_pct  = atoi(argv[++i]);
+        else if (strcmp(argv[i], "--bpc")       == 0 && i+1 < argc) max_bpc    = atoi(argv[++i]);
+        else if (strcmp(argv[i], "--gamut-mode") == 0 && i+1 < argc) {
+            gamut_mode = (strcmp(argv[++i], "dci-p3") == 0) ? 1 : 0;
+        }
     }
-    printf("config: sdr_nits=%d  peak_nits=%d  gamut=%d%%\n", sdr_nits, peak_nits, gamut_pct);
+    const char *gmode_str = (gamut_mode == 1) ? "DCI-P3" : "BT.2020";
+    printf("config: sdr_nits=%d  peak_nits=%d  gamut=%d%%  mode=%s  bpc=%d\n",
+           sdr_nits, peak_nits, gamut_pct, gmode_str, max_bpc);
 
     if (geteuid() != 0) { fprintf(stderr, "run as root: sudo cosmic-hdr\n"); return 1; }
 
@@ -308,9 +335,10 @@ int main(int argc, char **argv) {
         gam_lut = build_gamma_pq(LUT_SIZE, (double)sdr_nits);
         double t = gamut_pct / 100.0;
         double blended[3][3];
+        const double (*target)[3] = (gamut_mode == 1) ? CTM_709_TO_DCIP3 : CTM_709_TO_2020;
         for (int r = 0; r < 3; r++)
             for (int c = 0; c < 3; c++)
-                blended[r][c] = (r==c ? 1.0 : 0.0) * (1.0-t) + CTM_709_TO_2020[r][c] * t;
+                blended[r][c] = (r==c ? 1.0 : 0.0) * (1.0-t) + target[r][c] * t;
         build_ctm((const double(*)[3])blended, ctm9);
     }
 
@@ -351,6 +379,7 @@ int main(int argc, char **argv) {
         uint32_t p_crtc_id  = get_prop_id(fd, conn_id, DRM_MODE_OBJECT_CONNECTOR, "CRTC_ID");
         uint32_t p_crtc_act = get_prop_id(fd, crtc_id, DRM_MODE_OBJECT_CRTC,      "ACTIVE");
         uint32_t p_mode_id  = get_prop_id(fd, crtc_id, DRM_MODE_OBJECT_CRTC,      "MODE_ID");
+        uint32_t p_bpc      = get_prop_id(fd, conn_id, DRM_MODE_OBJECT_CONNECTOR, "max_requested_bpc");
 
         drmModeCrtcPtr cur = drmModeGetCrtc(fd, crtc_id);
         uint32_t mode_blob = 0;
@@ -363,6 +392,7 @@ int main(int argc, char **argv) {
         if (p_crtc_id)  drmModeAtomicAddProperty(req2, conn_id, p_crtc_id,  crtc_id);
         drmModeAtomicAddProperty(req2, conn_id, p_hdr,    hdr_blob);
         drmModeAtomicAddProperty(req2, conn_id, p_cspace, cspace_val);
+        if (p_bpc && !reset) drmModeAtomicAddProperty(req2, conn_id, p_bpc, (uint64_t)max_bpc);
         if (p_crtc_act) drmModeAtomicAddProperty(req2, crtc_id, p_crtc_act, 1);
         if (p_mode_id && mode_blob)
                         drmModeAtomicAddProperty(req2, crtc_id, p_mode_id,   mode_blob);
@@ -389,9 +419,9 @@ int main(int argc, char **argv) {
         if (reset)
             printf("✓ reset: SDR restored\n");
         else
-            printf("✓ HDR10 ACTIVE: sRGB→linear→BT.2020→PQ pipeline live\n"
-                   "  SDR white=%d nits  peak=%d nits  gamut=%d%%\n",
-                   sdr_nits, peak_nits, gamut_pct);
+            printf("✓ HDR10 ACTIVE: sRGB→linear→%s→PQ pipeline live\n"
+                   "  SDR white=%d nits  peak=%d nits  gamut=%d%%  bpc=%d\n",
+                   gmode_str, sdr_nits, peak_nits, gamut_pct, max_bpc);
     } else {
         printf("pipeline ret=%d  HDR ret=%d\n", ret, hdr_ret);
     }

@@ -1,28 +1,93 @@
 #!/usr/bin/env python3
 """cosmic-hdr-settings — HDR display calibration panel for COSMIC desktop"""
-import gi, subprocess, os
+import gi, subprocess, os, struct
 gi.require_version('Gtk', '4.0')
 gi.require_version('Adw', '1')
-from gi.repository import Gtk, Adw, GLib
+from gi.repository import Gtk, Adw, GLib, Gdk
 
 CONF = '/etc/cosmic-hdr.conf'
 BIN  = '/usr/local/bin/cosmic-hdr'
+EDID = '/sys/class/drm/card1-HDMI-A-2/edid'
 
-# ── config I/O ───────────────────────────────────────────────────────────────
+# ── EDID detection ────────────────────────────────────────────────────────────
+
+def detect_display():
+    try:
+        raw = open(EDID, 'rb').read()
+    except Exception:
+        return None
+
+    info = {
+        'name': 'Unknown Display', 'hdr10': False, 'hlg': False,
+        'hdr10plus': False, 'dolby': False, 'bt2020': False,
+        'max_lum_nits': 0,
+    }
+
+    # Monitor name from EDID descriptor blocks (bytes 54–125)
+    for i in range(54, 126, 18):
+        if raw[i:i+3] == b'\x00\x00\x00' and raw[i+3] == 0xfc:
+            info['name'] = raw[i+5:i+18].decode('ascii', errors='ignore').strip()
+            break
+
+    # CEA-861 extension blocks
+    for bs in range(128, len(raw), 128):
+        blk = raw[bs:bs+128]
+        if not blk or blk[0] != 0x02:
+            continue
+        dtd = blk[2]
+        i = 4
+        while i < dtd and i < 128:
+            tag    = (blk[i] >> 5) & 0x7
+            length = blk[i] & 0x1f
+            if i + 1 + length > 128:
+                break
+            data = blk[i+1:i+1+length]
+
+            if tag == 7 and length >= 1:           # Extended data block
+                ext_tag = data[0]
+                payload = data[1:]
+                if ext_tag == 6 and payload:       # HDR Static Metadata
+                    eotf = payload[0]
+                    info['hdr10'] = bool(eotf & 0x04)
+                    info['hlg']   = bool(eotf & 0x08)
+                    if len(payload) > 2 and payload[2]:
+                        info['max_lum_nits'] = int(50 * (2 ** (payload[2] / 32)))
+                elif ext_tag == 5 and payload:     # Colorimetry
+                    info['bt2020'] = bool(payload[0] & 0x80)
+                elif ext_tag == 13:                # HDR10+
+                    info['hdr10plus'] = True
+                elif ext_tag == 1 and len(payload) >= 3:  # Vendor Specific Video Data Block
+                    oui = int.from_bytes(payload[0:3], 'little')
+                    if oui == 0x00D046:            # Dolby Labs
+                        info['dolby'] = True
+            elif tag == 3 and length >= 3:         # Vendor Specific Data Block
+                oui = int.from_bytes(data[0:3], 'little')
+                if oui == 0x00D046:
+                    info['dolby'] = True
+
+            i += 1 + length
+
+    return info
+
+# ── config I/O ────────────────────────────────────────────────────────────────
 
 def read_conf():
-    d = {'SDR_NITS': 203, 'PEAK_NITS': 800, 'GAMUT': 100}
+    d = {'SDR_NITS': 203, 'PEAK_NITS': 800, 'GAMUT': 100,
+         'MAX_BPC': 10, 'GAMUT_MODE': 'bt2020'}
     try:
         for line in open(CONF):
             k, _, v = line.strip().partition('=')
-            if k in d:
+            if k in ('SDR_NITS', 'PEAK_NITS', 'GAMUT', 'MAX_BPC'):
                 try: d[k] = int(v)
                 except: pass
+            elif k == 'GAMUT_MODE':
+                d[k] = v.strip()
     except: pass
     return d
 
-def write_conf(sdr, peak, gamut):
-    txt = f'SDR_NITS={sdr}\nPEAK_NITS={peak}\nGAMUT={gamut}\n'
+def write_conf(sdr, peak, gamut, bpc, gmode):
+    txt = (f'SDR_NITS={sdr}\nPEAK_NITS={peak}\nGAMUT={gamut}\n'
+           f'MAX_BPC={bpc}\nGAMUT_MODE={gmode}\n')
     subprocess.run(['sudo', 'tee', CONF], input=txt.encode(), capture_output=True)
 
 def run_hdr(*args):
@@ -33,7 +98,47 @@ def service_active():
                        capture_output=True, text=True)
     return r.stdout.strip() == 'active'
 
-# ── UI ───────────────────────────────────────────────────────────────────────
+# ── calibration test pattern window ──────────────────────────────────────────
+
+def show_pattern(label, r, g, b):
+    win = Gtk.Window(title=f'Calibration — {label}')
+    win.set_default_size(1280, 720)
+
+    da = Gtk.DrawingArea()
+    da.set_draw_func(lambda a, cr, w, h, rgb=( r, g, b): (
+        cr.set_source_rgb(*rgb), cr.paint(),
+    ))
+
+    overlay = Gtk.Overlay()
+    overlay.set_child(da)
+
+    lbl = Gtk.Label(label=f'{label}  (press Esc or click to close)',
+                    css_classes=['calibration-hint'])
+    lbl.set_valign(Gtk.Align.END)
+    lbl.set_margin_bottom(18)
+    overlay.add_overlay(lbl)
+
+    win.set_child(overlay)
+    key_ctrl = Gtk.EventControllerKey()
+    key_ctrl.connect('key-pressed',
+        lambda c, k, kc, m, w=win: w.destroy() if k == Gdk.KEY_Escape else None)
+    win.add_controller(key_ctrl)
+    click = Gtk.GestureClick()
+    click.connect('pressed', lambda g, n, x, y, w=win: w.destroy())
+    da.add_controller(click)
+    win.present()
+
+PATTERNS = [
+    ('Black',      0.0,   0.0,   0.0),
+    ('Dark Gray',  0.1,   0.1,   0.1),
+    ('Gray 50%',   0.5,   0.5,   0.5),
+    ('White',      1.0,   1.0,   1.0),
+    ('Red',        1.0,   0.0,   0.0),
+    ('Green',      0.0,   1.0,   0.0),
+    ('Blue',       0.0,   0.0,   1.0),
+]
+
+# ── UI ────────────────────────────────────────────────────────────────────────
 
 class HDRSettings(Adw.Application):
     def __init__(self):
@@ -41,27 +146,58 @@ class HDRSettings(Adw.Application):
         self.connect('activate', self._build)
 
     def _build(self, app):
-        conf = read_conf()
+        conf  = read_conf()
+        disp  = detect_display()
 
         win = Adw.ApplicationWindow(application=app,
                                     title='Display — HDR Settings')
-        win.set_default_size(520, -1)
+        win.set_default_size(560, -1)
 
         tb = Adw.ToolbarView()
         tb.add_top_bar(Adw.HeaderBar())
 
-        clamp = Adw.Clamp(maximum_size=500,
-                           margin_top=16, margin_bottom=24,
+        scroll = Gtk.ScrolledWindow(vexpand=True, propagate_natural_height=True)
+        clamp = Adw.Clamp(maximum_size=520,
+                           margin_top=12, margin_bottom=24,
                            margin_start=16, margin_end=16)
-        root = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=20)
+        root = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=16)
         clamp.set_child(root)
-        tb.set_content(clamp)
+        scroll.set_child(clamp)
+        tb.set_content(scroll)
         win.set_content(tb)
 
+        # ── Display capabilities (EDID) ─────────────────────────────────────
+        if disp:
+            caps_grp = Adw.PreferencesGroup(
+                title=f'Display  ·  {disp["name"]}',
+                description='Detected from EDID')
+
+            def cap_row(title, val):
+                row = Adw.ActionRow(title=title)
+                icon = '✓' if val else '—'
+                row.add_suffix(Gtk.Label(label=icon,
+                    css_classes=['success'] if val else ['dim-label']))
+                row.set_activatable(False)
+                return row
+
+            caps_grp.add(cap_row('HDR10 (PQ / ST2084)', disp['hdr10']))
+            caps_grp.add(cap_row('HLG (Hybrid Log-Gamma)', disp['hlg']))
+            caps_grp.add(cap_row('HDR10+', disp['hdr10plus']))
+            caps_grp.add(cap_row('Dolby Vision', disp['dolby']))
+            caps_grp.add(cap_row('BT.2020 wide-colour', disp['bt2020']))
+
+            lum_row = Adw.ActionRow(title='Peak Luminance (EDID)')
+            lum_val = f'{disp["max_lum_nits"]} nits' if disp['max_lum_nits'] else 'Not specified'
+            lum_row.add_suffix(Gtk.Label(label=lum_val, css_classes=['dim-label']))
+            lum_row.set_activatable(False)
+            caps_grp.add(lum_row)
+
+            root.append(caps_grp)
+
         # ── HDR toggle ──────────────────────────────────────────────────────
-        hdr_grp = Adw.PreferencesGroup(title='HDR Output')
-        hdr_row = Adw.SwitchRow(title='Enable HDR10',
-                                 subtitle='BT.2020 + PQ signal · cosmic-hdr.service')
+        hdr_grp  = Adw.PreferencesGroup(title='HDR Output')
+        hdr_row  = Adw.SwitchRow(title='Enable HDR10',
+                                  subtitle='BT.2020 + PQ signal via cosmic-hdr.service')
         hdr_row.set_active(service_active())
         hdr_grp.add(hdr_row)
         root.append(hdr_grp)
@@ -69,34 +205,32 @@ class HDRSettings(Adw.Application):
         # ── Brightness ──────────────────────────────────────────────────────
         br_grp = Adw.PreferencesGroup(
             title='Brightness',
-            description='SDR White = how bright regular desktop content appears in HDR mode. '
-                        'Matches KDE "SDR Brightness". Peak = your display\'s max HDR luminance.')
+            description='SDR White = how bright desktop/SDR content appears in HDR mode.')
 
-        sdr_row = Adw.ActionRow(title='SDR White',
-                                 subtitle=f'{conf["SDR_NITS"]} nits')
-        sdr_adj = Gtk.Adjustment(value=conf['SDR_NITS'],
-                                  lower=80, upper=400, step_increment=1)
+        sdr_adj   = Gtk.Adjustment(value=conf['SDR_NITS'],
+                                    lower=80, upper=400, step_increment=1)
         sdr_scale = Gtk.Scale(orientation=Gtk.Orientation.HORIZONTAL,
                                adjustment=sdr_adj, draw_value=False,
-                               hexpand=True, width_request=220)
+                               hexpand=True, width_request=200)
         for v, l in [(100,'100'), (203,'203 ✦'), (300,'300')]:
             sdr_scale.add_mark(v, Gtk.PositionType.BOTTOM, l)
+        sdr_lbl  = Gtk.Label(label=f'{conf["SDR_NITS"]} nits', width_chars=8)
+        sdr_row  = Adw.ActionRow(title='SDR White')
         sdr_row.add_suffix(sdr_scale)
-        sdr_lbl = Gtk.Label(label=f'{conf["SDR_NITS"]}', width_chars=4)
         sdr_row.add_suffix(sdr_lbl)
         br_grp.add(sdr_row)
 
-        peak_row = Adw.ActionRow(title='Display Peak',
-                                  subtitle=f'{conf["PEAK_NITS"]} nits  (A85H OLED ≈ 800–1000)')
-        peak_adj = Gtk.Adjustment(value=conf['PEAK_NITS'],
-                                   lower=400, upper=1200, step_increment=10)
+        peak_adj   = Gtk.Adjustment(value=conf['PEAK_NITS'],
+                                     lower=400, upper=1200, step_increment=10)
         peak_scale = Gtk.Scale(orientation=Gtk.Orientation.HORIZONTAL,
                                 adjustment=peak_adj, draw_value=False,
-                                hexpand=True, width_request=220)
+                                hexpand=True, width_request=200)
         for v, l in [(800,'800 ✦'), (1000,'1000')]:
             peak_scale.add_mark(v, Gtk.PositionType.BOTTOM, l)
+        peak_lbl  = Gtk.Label(label=f'{conf["PEAK_NITS"]} nits', width_chars=8)
+        peak_row  = Adw.ActionRow(title='Display Peak',
+                                   subtitle='A85H OLED ≈ 800–1000 nits')
         peak_row.add_suffix(peak_scale)
-        peak_lbl = Gtk.Label(label=f'{conf["PEAK_NITS"]}', width_chars=5)
         peak_row.add_suffix(peak_lbl)
         br_grp.add(peak_row)
 
@@ -105,50 +239,136 @@ class HDRSettings(Adw.Application):
         # ── Colour ──────────────────────────────────────────────────────────
         col_grp = Adw.PreferencesGroup(
             title='Colour',
-            description='Gamut expansion via BT.709→BT.2020 CTM matrix (applied in linear light domain).')
+            description='Gamut expansion via CTM matrix in linear light domain.')
 
-        gamut_row = Adw.ActionRow(title='Gamut Expansion',
-                                   subtitle='0% = sRGB identical · 100% = full BT.2020 wide colour')
-        gamut_adj = Gtk.Adjustment(value=conf['GAMUT'],
-                                    lower=0, upper=100, step_increment=1)
+        # Gamut target combo
+        gmode_model = Gtk.StringList()
+        gmode_items = [('bt2020', 'BT.2020  (full wide colour — DCI cinemas, UHDTV)'),
+                       ('dci-p3', 'DCI-P3 D65  (Apple/cinema middle-ground)'),
+                       ('srgb',   'sRGB  (no gamut expansion, 0% blend only)')]
+        for k, _ in gmode_items:
+            gmode_model.append(k)
+        gmode_combo = Adw.ComboRow(title='Target Gamut',
+                                    subtitle='Colour space the CTM expands into')
+        gmode_combo.set_model(gmode_model)
+        # Override factory to show full descriptions
+        factory = Gtk.SignalListItemFactory()
+        def bind_item(f, item):
+            idx   = item.get_position()
+            label = Gtk.Label(label=gmode_items[idx][1] if idx < len(gmode_items) else '',
+                              xalign=0)
+            item.set_child(label)
+        factory.connect('bind', bind_item)
+        gmode_combo.set_factory(factory)
+        cur_gmode = conf['GAMUT_MODE']
+        cur_idx = next((i for i, (k, _) in enumerate(gmode_items) if k == cur_gmode), 0)
+        gmode_combo.set_selected(cur_idx)
+        col_grp.add(gmode_combo)
+
+        # Gamut expansion slider
+        gamut_adj   = Gtk.Adjustment(value=conf['GAMUT'],
+                                      lower=0, upper=100, step_increment=1)
         gamut_scale = Gtk.Scale(orientation=Gtk.Orientation.HORIZONTAL,
                                  adjustment=gamut_adj, draw_value=False,
-                                 hexpand=True, width_request=220)
+                                 hexpand=True, width_request=200)
         gamut_scale.add_mark(0,   Gtk.PositionType.BOTTOM, 'sRGB')
-        gamut_scale.add_mark(100, Gtk.PositionType.BOTTOM, 'BT.2020')
+        gamut_scale.add_mark(100, Gtk.PositionType.BOTTOM, '100%')
+        gamut_lbl   = Gtk.Label(label=f'{conf["GAMUT"]}%', width_chars=5)
+        gamut_row   = Adw.ActionRow(title='Expansion',
+                                     subtitle='Blend between sRGB and target gamut')
         gamut_row.add_suffix(gamut_scale)
-        gamut_lbl = Gtk.Label(label=f'{conf["GAMUT"]}%', width_chars=5)
         gamut_row.add_suffix(gamut_lbl)
         col_grp.add(gamut_row)
 
         root.append(col_grp)
 
-        # ── live label updates ───────────────────────────────────────────────
+        # ── Output format ────────────────────────────────────────────────────
+        out_grp = Adw.PreferencesGroup(
+            title='Output Format',
+            description='Requests higher bit depth from the GPU/driver.')
+
+        bpc_model = Gtk.StringList()
+        for s in ('8 bpc', '10 bpc  (recommended)', '12 bpc'):
+            bpc_model.append(s)
+        bpc_combo = Adw.ComboRow(title='Bit Depth',
+                                  subtitle='max_requested_bpc DRM property')
+        bpc_combo.set_model(bpc_model)
+        bpc_map   = {8: 0, 10: 1, 12: 2}
+        bpc_combo.set_selected(bpc_map.get(conf['MAX_BPC'], 1))
+        out_grp.add(bpc_combo)
+
+        root.append(out_grp)
+
+        # ── Calibration ──────────────────────────────────────────────────────
+        cal_grp = Adw.PreferencesGroup(
+            title='Calibration',
+            description='Fullscreen test patterns — click or press Esc to close.')
+
+        btn_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL,
+                           spacing=6, margin_top=4, margin_bottom=8,
+                           homogeneous=True)
+        for (name, r, g, b) in PATTERNS:
+            btn = Gtk.Button(label=name)
+            btn.connect('clicked', lambda _, n=name, rv=r, gv=g, bv=b:
+                        show_pattern(n, rv, gv, bv))
+            btn_box.append(btn)
+
+        cal_row = Adw.ActionRow(title='Test Patterns')
+        cal_row.add_suffix(btn_box)
+        cal_grp.add(cal_row)
+
+        # SDR/HDR split — left half SDR white, right half peak white
+        split_btn = Gtk.Button(label='SDR/HDR Split')
+        split_btn.set_tooltip_text('Left = SDR white (203 nits PQ encoded), Right = peak')
+        split_btn.connect('clicked', lambda _: show_split_pattern(
+            int(sdr_adj.get_value()), int(peak_adj.get_value())))
+        split_row = Adw.ActionRow(title='Split Pattern',
+                                   subtitle='SDR left / HDR peak right')
+        split_row.add_suffix(split_btn)
+        cal_grp.add(split_row)
+
+        root.append(cal_grp)
+
+        # ── Live label wiring ────────────────────────────────────────────────
         sdr_adj.connect('value-changed',
-            lambda a: sdr_lbl.set_label(f'{int(a.get_value())}'))
+            lambda a: sdr_lbl.set_label(f'{int(a.get_value())} nits'))
         peak_adj.connect('value-changed',
-            lambda a: peak_lbl.set_label(f'{int(a.get_value())}'))
+            lambda a: peak_lbl.set_label(f'{int(a.get_value())} nits'))
         gamut_adj.connect('value-changed',
             lambda a: gamut_lbl.set_label(f'{int(a.get_value())}%'))
 
-        # ── buttons ─────────────────────────────────────────────────────────
-        btn_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL,
-                           spacing=12, halign=Gtk.Align.END)
+        # ── Action buttons ───────────────────────────────────────────────────
+        btn_row   = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL,
+                             spacing=12, halign=Gtk.Align.END, margin_top=4)
         btn_reset = Gtk.Button(label='Reset to SDR', css_classes=['destructive-action'])
         btn_apply = Gtk.Button(label='Apply',        css_classes=['suggested-action'])
         btn_row.append(btn_reset)
         btn_row.append(btn_apply)
         root.append(btn_row)
 
-        # ── signal wiring ────────────────────────────────────────────────────
+        # ── Signal wiring ────────────────────────────────────────────────────
+        bpc_values = [8, 10, 12]
+
+        def get_gmode():
+            idx = gmode_combo.get_selected()
+            return gmode_items[idx][0] if idx < len(gmode_items) else 'bt2020'
+
+        def get_bpc():
+            idx = bpc_combo.get_selected()
+            return bpc_values[idx] if idx < len(bpc_values) else 10
+
         def apply(_=None):
-            sdr  = int(sdr_adj.get_value())
-            peak = int(peak_adj.get_value())
-            gam  = int(gamut_adj.get_value())
-            write_conf(sdr, peak, gam)
-            run_hdr(f'--sdr-nits', str(sdr),
-                    f'--peak-nits', str(peak),
-                    f'--gamut', str(gam))
+            sdr   = int(sdr_adj.get_value())
+            peak  = int(peak_adj.get_value())
+            gam   = int(gamut_adj.get_value())
+            bpc   = get_bpc()
+            gmode = get_gmode()
+            write_conf(sdr, peak, gam, bpc, gmode)
+            run_hdr('--sdr-nits',   str(sdr),
+                    '--peak-nits',  str(peak),
+                    '--gamut',      str(gam),
+                    '--bpc',        str(bpc),
+                    '--gamut-mode', gmode)
             hdr_row.set_active(True)
 
         def reset(_=None):
@@ -164,6 +384,46 @@ class HDRSettings(Adw.Application):
         hdr_row.connect('notify::active', on_hdr_toggle)
 
         win.present()
+
+
+def show_split_pattern(sdr_nits, peak_nits):
+    win = Gtk.Window(title='Split Pattern — SDR / HDR Peak')
+    win.set_default_size(1280, 720)
+
+    # sdr linear → PQ code value [0..1]
+    def pq(L):
+        if L <= 0: return 0.0
+        m1, m2 = 0.1593017578125, 78.84375
+        c1, c2, c3 = 0.8359375, 18.8515625, 18.6875
+        Lm = L ** m1
+        return ((c1 + c2*Lm) / (1 + c3*Lm)) ** m2
+
+    sdr_val  = pq(sdr_nits  / 10000.0)
+    peak_val = pq(peak_nits / 10000.0)
+
+    def draw(area, cr, w, h):
+        cr.set_source_rgb(sdr_val, sdr_val, sdr_val)
+        cr.rectangle(0, 0, w//2, h); cr.fill()
+        cr.set_source_rgb(peak_val, peak_val, peak_val)
+        cr.rectangle(w//2, 0, w//2, h); cr.fill()
+        # Labels
+        cr.set_source_rgb(0.5, 0.5, 0.5)
+        cr.select_font_face('Monospace', 0, 0)
+        cr.set_font_size(24)
+        cr.move_to(24, 48); cr.show_text(f'SDR white  {sdr_nits} nits')
+        cr.move_to(w//2 + 24, 48); cr.show_text(f'Peak  {peak_nits} nits')
+
+    da = Gtk.DrawingArea()
+    da.set_draw_func(draw)
+    win.set_child(da)
+    key_ctrl = Gtk.EventControllerKey()
+    key_ctrl.connect('key-pressed',
+        lambda c, k, kc, m, w=win: w.destroy() if k == Gdk.KEY_Escape else None)
+    win.add_controller(key_ctrl)
+    click = Gtk.GestureClick()
+    click.connect('pressed', lambda g, n, x, y, w=win: w.destroy())
+    da.add_controller(click)
+    win.present()
 
 
 HDRSettings().run(None)
